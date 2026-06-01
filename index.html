@@ -98,6 +98,16 @@
   // Verifica supporto Vibration API una sola volta
   const canVibrate = typeof navigator.vibrate === "function";
 
+  /* Pattern di vibrazione quando si tocca un'impronta altrui.
+     NB: il web NON permette di regolare l'INTENSITÀ del motorino, solo durata
+     e pattern. Un pattern a impulsi ravvicinati [vibra, pausa, vibra, ...]
+     viene percepito come più "denso"/forte di un singolo colpo.
+     I numeri sono millisecondi: dispari = vibra, pari = pausa.
+     - Singolo colpo soft:   [55]
+     - Più denso (default):  [60, 30, 60, 30, 60]
+     - Molto marcato:        [80, 30, 80, 30, 80, 30, 80] */
+  const VIBRATION_PATTERN = [60, 30, 60, 30, 60];
+
   // Mappa senderId -> elemento <img> dell'impronta (una per ogni utente remoto)
   const remoteFingerprints = new Map();
 
@@ -168,7 +178,7 @@
       const cy = parseFloat(el.style.top);
       if (x >= cx - FP_HALF && x <= cx + FP_HALF &&
           y >= cy - FP_HALF && y <= cy + FP_HALF) {
-        if (canVibrate) navigator.vibrate(55); // vibrazione breve ~55ms
+        if (canVibrate) navigator.vibrate(VIBRATION_PATTERN); // pattern a impulsi
         return true;
       }
     }
