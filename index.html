@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>Intouch</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #ffffff;          /* sfondo completamente bianco */
+      touch-action: none;           /* disabilita scroll/zoom/pull-to-refresh */
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    /* Livello che occupa tutto il viewport e ospita impronte + ripple */
+    #stage {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Impronta digitale di un ALTRO utente (ne possono esistere più di una) */
+    .fingerprint {
+      position: fixed;
+      width: 120px;
+      height: 120px;
+      pointer-events: none;          /* non intercetta i tocchi locali */
+      transform: translate(-50%, -50%);
+      opacity: 0;
+      transition: opacity 0.15s ease;
+      will-change: left, top, opacity;
+    }
+    .fingerprint.visible { opacity: 1; }
+
+    /* Effetto ripple nel punto del tocco */
+    .ripple {
+      position: fixed;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.18);
+      transform: translate(-50%, -50%) scale(0);
+      animation: ripple-expand 0.45s ease-out forwards;
+      pointer-events: none;
+    }
+    @keyframes ripple-expand {
+      0%   { transform: translate(-50%, -50%) scale(0);   opacity: 1; }
+      100% { transform: translate(-50%, -50%) scale(3.2); opacity: 0; }
+    }
+
+    /* Indicatore di stato connessione (piccolo, in alto a sinistra) */
+    #status {
+      position: fixed;
+      top: max(8px, env(safe-area-inset-top));
+      left: max(8px, env(safe-area-inset-left));
+      font: 12px/1.2 system-ui, sans-serif;
+      color: #bbb;
+      pointer-events: none;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="status">…</div>
+
+  <script>
+  /* =========================================================================
+     INTOUCH — client simmetrico
+     - Ogni dispositivo invia i propri tocchi (coordinate normalizzate 0..1)
+     - Riceve i tocchi degli ALTRI e disegna un'impronta che li segue
+     - Vibra se tocco dentro l'area di un'impronta altrui visibile
+     ========================================================================= */
+
+  /* ---- 1. CONFIG: indirizzo del server WebSocket ----
+     In locale usa ws://localhost:3000 (per testare sul PC).
+     In produzione metti qui l'URL del tuo server su Render (wss://...). */
+  const REMOTE_WS_URL = "wss://intouch-server.onrender.com"; // <-- SOSTITUISCI con il tuo URL Render
+  const WS_URL =
+    (location.hostname === "localhost" || location.hostname === "127.0.0.1")
+      ? "ws://localhost:3000"
+      : REMOTE_WS_URL;
+
+  /* ---- 2. Riferimenti DOM e costanti ---- */
+  const stage   = document.getElementById("stage");
+  const statusEl = document.getElementById("status");
+  const FP_SIZE = 120;            // lato dell'impronta in px
+  const FP_HALF = FP_SIZE / 2;    // raggio per il test di collisione
+
+  // Verifica supporto Vibration API una sola volta
+  const canVibrate = typeof navigator.vibrate === "function";
+
+  // Mappa senderId -> elemento <img> dell'impronta (una per ogni utente remoto)
+  const remoteFingerprints = new Map();
+
+  /* ---- 3. Utilità coordinate ---- */
+  // Normalizza un punto pixel -> 0..1 (per inviarlo, indipendente dallo schermo)
+  function norm(x, y) {
+    return { x: x / window.innerWidth, y: y / window.innerHeight };
+  }
+  // Denormalizza 0..1 -> pixel sullo schermo di QUESTO dispositivo
+  function denorm(nx, ny) {
+    return { x: nx * window.innerWidth, y: ny * window.innerHeight };
+  }
+
+  /* ---- 4. Rendering impronte remote ---- */
+  function getOrCreateFingerprint(id) {
+    let el = remoteFingerprints.get(id);
+    if (!el) {
+      el = document.createElement("img");
+      el.className = "fingerprint";
+      el.src = "img/fingerprint.png";
+      el.alt = "Impronta digitale";
+      el.draggable = false;
+      stage.appendChild(el);
+      remoteFingerprints.set(id, el);
+    }
+    return el;
+  }
+
+  function showRemoteFingerprint(id, nx, ny) {
+    const { x, y } = denorm(nx, ny);
+    const el = getOrCreateFingerprint(id);
+    el.style.left = x + "px";
+    el.style.top  = y + "px";
+    // forza un reflow minimo non necessario; basta aggiungere la classe
+    el.classList.add("visible");
+  }
+
+  function removeRemoteFingerprint(id) {
+    const el = remoteFingerprints.get(id);
+    if (!el) return;
+    el.classList.remove("visible");
+    // Rimuove l'elemento dal DOM dopo la dissolvenza
+    setTimeout(() => {
+      if (!el.classList.contains("visible")) {
+        el.remove();
+        remoteFingerprints.delete(id);
+      }
+    }, 200);
+  }
+
+  /* ---- 5. Effetto ripple ---- */
+  function spawnRipple(x, y) {
+    const dot = document.createElement("div");
+    dot.className = "ripple";
+    dot.style.left = x + "px";
+    dot.style.top  = y + "px";
+    stage.appendChild(dot);
+    dot.addEventListener("animationend", () => dot.remove());
+  }
+
+  /* ---- 6. Collisione + vibrazione ----
+     Controlla se il punto locale (px) cade dentro QUALSIASI impronta remota
+     visibile; in tal caso fa vibrare brevemente il dispositivo. */
+  function checkHitAndBuzz(x, y) {
+    for (const el of remoteFingerprints.values()) {
+      if (!el.classList.contains("visible")) continue;
+      const cx = parseFloat(el.style.left);
+      const cy = parseFloat(el.style.top);
+      if (x >= cx - FP_HALF && x <= cx + FP_HALF &&
+          y >= cy - FP_HALF && y <= cy + FP_HALF) {
+        if (canVibrate) navigator.vibrate(55); // vibrazione breve ~55ms
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* ---- 7. WebSocket: connessione, invio, ricezione ---- */
+  let ws = null;
+  let wsReady = false;
+  let reconnectTimer = null;
+
+  function setStatus(text, color) {
+    statusEl.textContent = text;
+    statusEl.style.color = color || "#bbb";
+  }
+
+  function connect() {
+    setStatus("connessione…", "#bbb");
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      wsReady = true;
+      setStatus("● online", "#4caf50");
+    };
+
+    ws.onclose = () => {
+      wsReady = false;
+      setStatus("● offline (riconnessione…)", "#e53935");
+      // Pulisce le impronte remote: i mittenti non sono più validi
+      for (const id of remoteFingerprints.keys()) removeRemoteFingerprint(id);
+      // Riprova a connettersi dopo 2s
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 2000);
+    };
+
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+
+    ws.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_) { return; }
+      // msg = { t: "start"|"move"|"end", id, x, y }
+      switch (msg.t) {
+        case "start": {
+          showRemoteFingerprint(msg.id, msg.x, msg.y);
+          const p = denorm(msg.x, msg.y);
+          spawnRipple(p.x, p.y); // ripple sul punto del tocco remoto
+          break;
+        }
+        case "move":
+          showRemoteFingerprint(msg.id, msg.x, msg.y);
+          break;
+        case "end":
+          removeRemoteFingerprint(msg.id);
+          break;
+      }
+    };
+  }
+
+  // Invia un evento al server (se connesso)
+  function send(t, nx, ny) {
+    if (!wsReady) return;
+    ws.send(JSON.stringify({ t, x: nx, y: ny }));
+  }
+
+  /* ---- 8. Throttle dell'invio dei movimenti (1 invio per frame) ---- */
+  let pendingMove = null;
+  function queueMove(nx, ny) {
+    pendingMove = { nx, ny };
+  }
+  function flushMove() {
+    if (pendingMove) {
+      send("move", pendingMove.nx, pendingMove.ny);
+      pendingMove = null;
+    }
+    requestAnimationFrame(flushMove);
+  }
+  requestAnimationFrame(flushMove);
+
+  /* ---- 9. Gestione INPUT locale (touch + mouse) ----
+     Tracciamo UN tocco "primario" per dispositivo: quello che invia l'impronta.
+     Ogni tocco locale, inoltre, controlla la collisione con le impronte remote. */
+  let activePointerId = null; // identificatore del dito/tocco primario locale
+
+  function onPointerStart(x, y, pointerId) {
+    // Ogni tocco locale può attivare la vibrazione se centra un'impronta remota
+    checkHitAndBuzz(x, y);
+
+    // Solo il primo tocco diventa "primario" e viene trasmesso come impronta
+    if (activePointerId === null) {
+      activePointerId = pointerId;
+      const n = norm(x, y);
+      send("start", n.x, n.y);
+    }
+  }
+
+  function onPointerMove(x, y, pointerId) {
+    if (pointerId === activePointerId) {
+      const n = norm(x, y);
+      queueMove(n.x, n.y);
+    }
+  }
+
+  function onPointerEnd(pointerId) {
+    if (pointerId === activePointerId) {
+      activePointerId = null;
+      pendingMove = null;
+      send("end", 0, 0);
+    }
+  }
+
+  /* --- Eventi TOUCH (mobile) --- */
+  document.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) onPointerStart(t.clientX, t.clientY, t.identifier);
+  }, { passive: false });
+
+  document.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) onPointerMove(t.clientX, t.clientY, t.identifier);
+  }, { passive: false });
+
+  document.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) onPointerEnd(t.identifier);
+  }, { passive: false });
+
+  document.addEventListener("touchcancel", (e) => {
+    for (const t of e.changedTouches) onPointerEnd(t.identifier);
+  });
+
+  /* --- Eventi MOUSE (test da desktop) --- */
+  const MOUSE_ID = "mouse";
+  let mouseDown = false;
+  document.addEventListener("mousedown", (e) => {
+    mouseDown = true;
+    onPointerStart(e.clientX, e.clientY, MOUSE_ID);
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (mouseDown) onPointerMove(e.clientX, e.clientY, MOUSE_ID);
+  });
+  document.addEventListener("mouseup", () => {
+    mouseDown = false;
+    onPointerEnd(MOUSE_ID);
+  });
+
+  /* ---- 10. Avvio ---- */
+  if (!canVibrate) console.info("Vibration API non supportata su questo dispositivo/browser.");
+  connect();
+  </script>
+</body>
+</html>
