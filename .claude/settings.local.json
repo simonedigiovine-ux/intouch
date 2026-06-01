@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(git -C $d add -A)",
-      "PowerShell(git -C $d push origin main 2>&1)",
-      "PowerShell($d=\"C:\\\\Users\\\\Jarwis\\\\Desktop\\\\Intouch\")"
-    ]
-  }
-}
